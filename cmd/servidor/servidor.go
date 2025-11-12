@@ -7,7 +7,6 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync"
 )
 
 type Game struct {
@@ -15,41 +14,56 @@ type Game struct {
 	players       [2]net.Conn
 	playerCount   int
 	currentPlayer int
-	mu            sync.Mutex
+}
+
+type PlayerAction struct {
+	playerIndex int
+	message     string
+	conn        net.Conn
+	actionType  string
 }
 
 var game Game
+var actions = make(chan PlayerAction)
 
 func main() {
-	log.Println("Inciando servidor na porta :8000")
+	log.Println("Iniciando servidor (com Canais) na porta :8000")
 
-	listner, err := net.Listen("tcp", ":8000")
+	listener, err := net.Listen("tcp", ":8000")
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer listener.Close()
 
-	defer listner.Close()
 	resetGame()
-
-	game.currentPlayer = 0
+	go gameManager()
 
 	for {
-		conn, err := listner.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			log.Printf("Erro ao aceitar conexão: %v\n", err)
 			continue
 		}
-
-		go HandleConnection(conn)
+		go handleConnection(conn)
 	}
 }
 
-func HandleConnection(conn net.Conn) {
+func gameManager() {
+	for action := range actions {
+		switch action.actionType {
+		case "CONNECT":
+			handlePlayerConnect(action.conn)
+		case "PLAY":
+			processarJogada(action.playerIndex, action.message)
+		case "DISCONNECT":
+			handlePlayerDisconnect(action.playerIndex)
+		}
+	}
+}
 
-	game.mu.Lock()
-
-	var playerSymbol string
+func handlePlayerConnect(conn net.Conn) {
 	var playerIndex int
+	var playerSymbol string
 
 	if game.playerCount == 0 {
 		playerIndex = 0
@@ -57,59 +71,86 @@ func HandleConnection(conn net.Conn) {
 		game.players[playerIndex] = conn
 		game.playerCount++
 
-		log.Printf("Jogador 1 (X) conectado: %s", conn.RemoteAddr().String())
-		fmt.Fprintln(conn, "BEMVINDO JOGADOR 1. VOCÊ É O 'X'")
-		fmt.Fprintln(conn, "Aguardando Jogador 2...")
+		log.Printf("Jogador 1 (%s) conectado: %s", conn.RemoteAddr().String(), playerSymbol)
+		fmt.Fprintln(conn, "SYMBOL:X")
+		fmt.Fprintln(conn, "MSG:BEMVINDO JOGADOR 1. VOCÊ É O 'X'.")
+		fmt.Fprintln(conn, "MSG:Aguardando Jogador 2...")
+
 	} else if game.playerCount == 1 {
 		playerIndex = 1
 		playerSymbol = "O"
 		game.players[playerIndex] = conn
 		game.playerCount++
 
-		log.Printf("Jogador 2 (O) conectado: %s", conn.RemoteAddr().String())
-		fmt.Fprintln(conn, "BEMVINDO JOGADOR 2. VOCÊ É O 'O'")
-		fmt.Fprintln(conn, "O JOGO VAI COMEÇAR.")
+		log.Printf("Jogador 2 (%s) conectado: %s", conn.RemoteAddr().String(), playerSymbol)
+		fmt.Fprintln(conn, "SYMBOL:O")
+		fmt.Fprintln(conn, "MSG:BEMVINDO JOGADOR 2. VOCÊ É O 'O'.")
+
+		broadcast("MSG:O JOGO COMEÇOU.")
 		broadcast(getBoardString())
-		broadcast("Turno do jogador X")
+		broadcast(fmt.Sprintf("TURN:%s", "X"))
 
 	} else {
 		log.Printf("Conexão recusada (jogo cheio): %s", conn.RemoteAddr().String())
-		fmt.Fprintln(conn, "Jogo Cheio")
+		fmt.Fprintln(conn, "ERROR:DESCULPE, O JOGO JÁ ESTÁ CHEIO.")
 		conn.Close()
-		game.mu.Unlock()
 		return
 	}
-	game.mu.Unlock()
 
-	log.Printf("Novo jogador conectado: %s", conn.RemoteAddr().String())
+	go listenForPlayerMessages(conn, playerIndex)
+}
 
-	defer conn.Close()
+func handleConnection(conn net.Conn) {
+	actions <- PlayerAction{
+		conn:       conn,
+		actionType: "CONNECT",
+	}
+}
 
+func listenForPlayerMessages(conn net.Conn, playerIndex int) {
 	reader := bufio.NewReader(conn)
+	playerSymbol := "X"
+	if playerIndex == 1 {
+		playerSymbol = "O"
+	}
+
 	for {
 		message, err := reader.ReadString('\n')
 		if err != nil {
-			log.Printf("Jogador %s (%s) desconectou.", conn.RemoteAddr(), playerSymbol)
-			game.mu.Lock()
-			opponentIndex := (playerIndex + 1) % 2
-			if game.players[opponentIndex] != nil {
-				fmt.Fprintf(game.players[opponentIndex], "%s", fmt.Sprintf("JOGADOR %s DESCONECTOU.", playerSymbol))
+			log.Printf("Jogador %s (%s) desconectou (leitura).", conn.RemoteAddr(), playerSymbol)
+			actions <- PlayerAction{
+				playerIndex: playerIndex,
+				actionType:  "DISCONNECT",
 			}
-			resetGame()
-			game.mu.Unlock()
 			return
 		}
 
 		cleanMessage := strings.TrimSpace(message)
 		log.Printf("Mensagem de (%s): %s", playerSymbol, cleanMessage)
-		processarJogada(playerIndex, cleanMessage)
+
+		actions <- PlayerAction{
+			playerIndex: playerIndex,
+			message:     cleanMessage,
+			actionType:  "PLAY",
+		}
 	}
 }
 
-func processarJogada(playerIndex int, message string) {
-	game.mu.Lock()
-	defer game.mu.Unlock()
+func handlePlayerDisconnect(playerIndex int) {
+	playerSymbol := "X"
+	if playerIndex == 1 {
+		playerSymbol = "O"
+	}
 
+	log.Printf("Jogador %s (%d) desconectou.", playerSymbol, playerIndex)
+	opponentIndex := (playerIndex + 1) % 2
+	if game.players[opponentIndex] != nil {
+		fmt.Fprintln(game.players[opponentIndex], fmt.Sprintf("MSG:JOGADOR %s DESCONECTOU.", playerSymbol))
+	}
+	resetGame()
+}
+
+func processarJogada(playerIndex int, message string) {
 	conn := game.players[playerIndex]
 	playerSymbol := "X"
 	if playerIndex == 1 {
@@ -117,18 +158,17 @@ func processarJogada(playerIndex int, message string) {
 	}
 
 	if game.playerCount < 2 {
-		fmt.Fprintln(conn, "Erro: esperando outro jogador")
+		fmt.Fprintln(conn, "ERROR:Esperando o outro jogador entrar.")
 		return
 	}
-
 	if playerIndex != game.currentPlayer {
-		fmt.Println(conn, "Erro: não é sua vez")
+		fmt.Fprintln(conn, "ERROR:Não é a sua vez.")
 		return
 	}
 
 	coords := strings.Split(message, ",")
 	if len(coords) != 2 {
-		fmt.Fprintln(conn, "ERRO: Formato inválido. Use: linha,coluna (ex: 0,2)")
+		fmt.Fprintln(conn, "ERROR:Formato inválido. Use: linha,coluna")
 		return
 	}
 
@@ -136,20 +176,21 @@ func processarJogada(playerIndex int, message string) {
 	col, errCol := strconv.Atoi(coords[1])
 
 	if errRow != nil || errCol != nil || row < 0 || row > 2 || col < 0 || col > 2 {
-		fmt.Fprintln(conn, "ERRO: Posição inválida. Use números de 0 a 2.")
+		fmt.Fprintln(conn, "ERROR:Posição inválida. Use números de 0 a 2.")
+		return
+	}
+	if game.board[row][col] != "" {
+		fmt.Fprintln(conn, "ERROR:Posição já ocupada.")
 		return
 	}
 
-	if game.board[row][col] != "" {
-		fmt.Fprintln(conn, "ERRO: Posição já ocupada.")
-		return
-	}
 	game.board[row][col] = playerSymbol
-	broadcast(fmt.Sprintf("JOGADA: %s jogou em %d,%d", playerSymbol, row, col))
+	broadcast(fmt.Sprintf("MSG:JOGADA: %s jogou em %d,%d", playerSymbol, row, col))
 	broadcast(getBoardString())
 
 	if checkWin(playerSymbol) {
-		broadcast(fmt.Sprintf("FIM DE JOGO! JOGADOR %s VENCEU!", playerSymbol))
+		broadcast(fmt.Sprintf("MSG:FIM DE JOGO! JOGADOR %s VENCEU!", playerSymbol))
+		broadcast(getBoardString())
 		resetGame()
 		return
 	}
@@ -162,20 +203,19 @@ func processarJogada(playerIndex int, message string) {
 			}
 		}
 	}
-
 	if isDraw {
-		broadcast("FIM DE JOGO! EMPATE!")
+		broadcast("MSG:FIM DE JOGO! EMPATE!")
+		broadcast(getBoardString())
 		resetGame()
 		return
 	}
 
-	game.currentPlayer = (game.currentPlayer + 1) % 2 // Alterna 0 -> 1 -> 0
+	game.currentPlayer = (game.currentPlayer + 1) % 2
 	nextPlayerSymbol := "X"
 	if game.currentPlayer == 1 {
 		nextPlayerSymbol = "O"
 	}
-	broadcast(fmt.Sprintf("TURNO DO JOGADOR: %s", nextPlayerSymbol))
-
+	broadcast(fmt.Sprintf("TURN:%s", nextPlayerSymbol))
 }
 
 func broadcast(message string) {
@@ -186,18 +226,21 @@ func broadcast(message string) {
 		}
 	}
 }
+
 func getBoardString() string {
 	var b strings.Builder
-	b.WriteString("\nTABULEIRO:\n")
+	b.WriteString("BOARD:")
 	for r := 0; r < 3; r++ {
 		for c := 0; c < 3; c++ {
 			spot := game.board[r][c]
 			if spot == "" {
 				spot = "."
 			}
-			b.WriteString(spot + " ")
+			b.WriteString(spot)
 		}
-		b.WriteString("\n")
+		if r < 2 {
+			b.WriteString(";")
+		}
 	}
 	return b.String()
 }
